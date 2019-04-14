@@ -70,6 +70,13 @@ found:
   memset(p->context, 0, sizeof *p->context);
   p->context->eip = (uint)forkret;
 
+  // Initialize time fields
+  p->ctime = ticks;
+  p->ttime = 0;
+  p->stime = 0;
+  p->retime = 0;
+  p->rutime = 0;
+  
   return p;
 }
 
@@ -254,6 +261,53 @@ wait(void)
   }
 }
 
+int wait_stat(int *wtime, int *rtime, int *iotime, int* status)
+{ // Just like wait() but the int values get changed.
+  struct proc *p;
+  int havekids, pid;
+
+  acquire(&ptable.lock);
+  for(;;){
+    // Scan through table looking for zombie children.
+    havekids = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->parent != proc)
+        continue;
+      havekids = 1;
+      if(p->state == ZOMBIE){
+        // Found one.
+        // Update times below
+        *iotime = p->retime;
+        *wtime = p->ttime - p->ctime - p->rutime - p->iotime;
+        *rtime = p->rutime;
+        
+        pid = p->pid;
+        kfree(p->kstack);
+        p->kstack = 0;
+        freevm(p->pgdir);
+        p->state = UNUSED;
+        p->pid = 0;
+        p->parent = 0;
+        p->name[0] = 0;
+        p->killed = 0;
+        release(&ptable.lock);
+		status = pid; 				// Status is updated to pid when a child is terminated.
+        return pid;
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havekids || proc->killed){
+      release(&ptable.lock);
+	  status = -1;					// Status is updated to -1 where there is no child.
+      return -1;
+    }
+
+    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
+    sleep(proc, &ptable.lock);  //DOC: wait-sleep
+}
+}
+
 //PAGEBREAK: 42
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
@@ -293,6 +347,69 @@ scheduler(void)
     release(&ptable.lock);
 
   }
+}
+
+void
+scheduler(void)
+{
+	struct proc *p = 0;
+	
+	struct cpu *c = mycpu();
+	c->proc = 0;
+	
+	for(;;){
+		// Enable interrupts on this processor.
+		sti();
+		
+		// Loop over process table looking for process to run.
+		acquire(&ptable.lock);
+		for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+			
+			#ifdef DEFAULT
+			if(p->state != RUNNABLE)
+				continue;
+			#else
+			
+			#ifdef FCFS
+				struct proc *first = 0;
+				if(p->stated != RUNNABLE){
+					continue;
+				}
+				if(p->pid > 1){
+					if(first != 0){
+						if(p->ctime < first->ctime){
+							first = p;
+						}
+					else {
+						first = p;
+					}
+				}
+				if(first != 0 && first->state == RUNNABLE){}
+					p = first;
+				}
+			
+			#endif
+			#endif
+			
+			if(p != 0){
+				// Same as regular scheduler:
+				// Switch to chosen process.  It is the process's job
+				// to release ptable.lock and then reacquire it
+				// before jumping back to us.
+				c->proc = p;
+				switchuvm(p);
+				p->state = RUNNING;
+				
+				swtch(&(c->scheduler), p->context);
+				switchkvm();
+				
+				// Process is done running for now.
+				// It should have changed its p->state before coming back.
+				c->proc = 0;
+			}
+		}
+		release(&ptable.lock);
+	}
 }
 
 // Enter scheduler.  Must hold only ptable.lock
